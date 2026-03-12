@@ -34,6 +34,6 @@ jobs:
         run: |
           git config user.name "situations-bot"
           git config user.email "bot@situations-tracker"
-          git add results.csv
+          git add results.csv || true
           git diff --cached --quiet || git commit -m "scan: $(date +'%Y-%m-%d')"
           git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
