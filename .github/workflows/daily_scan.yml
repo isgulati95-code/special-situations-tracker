@@ -1,0 +1,40 @@
+name: Special Situations Daily Scan
+
+on:
+  schedule:
+    # 9:00 AM IST = 3:30 AM UTC, Monday to Friday
+    - cron: '30 3 * * 1-5'
+  workflow_dispatch:
+    # Lets you trigger manually from the GitHub UI (for testing)
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Give the job permission to write back to the repo
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python main.py
+
+      - name: Commit and push results.csv
+        run: |
+          git config user.name  "situations-bot"
+          git config user.email "bot@situations-tracker"
+          git add results.csv
+          git diff --cached --quiet || git commit -m "scan: $(date +'%Y-%m-%d')"
+          git push
