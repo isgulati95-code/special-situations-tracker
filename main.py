@@ -1,21 +1,21 @@
 """
 Special Situations Scanner — NSE + BSE
-Runs daily via GitHub Actions.
-Filters announcements by keyword + market cap,
-appends results to results.csv in the repo.
-Google Sheets pulls from this CSV automatically via IMPORTDATA formula.
+Uses BSE's public XML announcement feed + NSE's public corporate actions API.
+Runs daily via GitHub Actions → appends to results.csv.
+Google Sheets reads the CSV via IMPORTDATA formula.
 """
- 
+
 import requests
 import csv
 import datetime
 import time
 import os
- 
+import xml.etree.ElementTree as ET
+
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
- 
-MARKET_CAP_MIN_CR = 1000  # Drop companies below this (INR Crores)
- 
+
+MARKET_CAP_MIN_CR = 1000
+
 KEYWORDS = [
     "demerger", "de-merger", "spin off", "spin-off", "spinoff",
     "hive off", "scheme of arrangement", "scheme of demerger",
@@ -27,7 +27,7 @@ KEYWORDS = [
     "restructur", "post-merger listing", "fresh listing",
     "record date", "rights issue", "buyback", "buy-back",
 ]
- 
+
 CATEGORY_MAP = {
     "Spin-off / Demerger":   ["demerger", "de-merger", "spin off", "spin-off", "spinoff", "hive off", "scheme of arrangement", "scheme of demerger"],
     "Merger / Amalgamation": ["merger", "amalgamation", "resulting company", "post-merger"],
@@ -36,81 +36,84 @@ CATEGORY_MAP = {
     "NCLT / Post-Reorg":     ["nclt", "national company law tribunal", "business transfer", "slump sale"],
     "Record Date / Buyback": ["record date", "buyback", "buy-back"],
 }
- 
+
 CSV_FILE = "results.csv"
- 
-HEADER = [
-    "Date", "Exchange", "Ticker", "Company",
-    "Category", "Headline", "Market Cap (Cr)", "Source URL"
-]
- 
+HEADER   = ["Date", "Exchange", "Ticker", "Company", "Category", "Headline", "Market Cap (Cr)", "Source URL"]
+
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
- 
+
 def is_special_situation(text: str) -> bool:
-    t = text.lower()
-    return any(kw in t for kw in KEYWORDS)
- 
+    return any(kw in text.lower() for kw in KEYWORDS)
+
 def categorize(text: str) -> str:
     t = text.lower()
     for category, keys in CATEGORY_MAP.items():
         if any(k in t for k in keys):
             return category
     return "Other Special Situation"
- 
+
 def get_market_cap_cr(ticker: str) -> float | None:
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        mcap = data["chart"]["result"][0]["meta"].get("marketCap")
+        r   = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        mcap = r.json()["chart"]["result"][0]["meta"].get("marketCap")
         if mcap:
             return round(mcap / 1e7, 0)
     except Exception:
         pass
     return None
- 
-# ─── BSE ──────────────────────────────────────────────────────────────────────
- 
-def fetch_bse(days_back: int = 1) -> list[dict]:
-    today   = datetime.date.today()
-    from_dt = today - datetime.timedelta(days=days_back)
-    url     = "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
-    params  = {
-        "strCat": "-1", "strType": "C", "strScrip": "",
-        "strSearch": "", "strTodt": today.strftime("%Y%m%d"),
-        "strFromdt": from_dt.strftime("%Y%m%d"), "bseliveFlag": "0"
-    }
+
+# ─── BSE XML FEED ─────────────────────────────────────────────────────────────
+
+def fetch_bse_xml() -> list[dict]:
+    urls = [
+        "https://www.bseindia.com/xml-data/corpfiling/annexp/annexure.xml",
+        "https://www.bseindia.com/xml-data/corpfiling/annexp/annexure1.xml",
+    ]
+    results = []
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/xml, text/xml, */*",
         "Referer": "https://www.bseindia.com/",
-        "Accept": "application/json",
     }
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=20)
-        r.raise_for_status()
-        return r.json().get("Table", [])
-    except Exception as e:
-        print(f"  ⚠️  BSE fetch error: {e}")
-        return []
- 
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for item in root.iter("row"):
+                results.append({
+                    "headline":   item.findtext("HEADLINE") or item.findtext("NEWSSUB") or "",
+                    "scrip_code": item.findtext("SCRIP_CD") or "",
+                    "company":    item.findtext("SLONGNAME") or item.findtext("SCRIP_CD") or "",
+                    "date":       (item.findtext("NEWS_DT") or item.findtext("DT_TM") or "")[:10],
+                })
+        except Exception as e:
+            print(f"  ⚠️  BSE XML feed error ({url}): {e}")
+    return results
+
 def process_bse(raw: list[dict]) -> list[dict]:
     results = []
+    today   = str(datetime.date.today())
+    cutoff  = str(datetime.date.today() - datetime.timedelta(days=3))
+
     for ann in raw:
-        headline = (ann.get("HEADLINE") or ann.get("NEWSSUB") or "").strip()
+        headline = ann["headline"].strip()
+        date     = ann["date"] or today
+        if date < cutoff:
+            continue
         if not headline or not is_special_situation(headline):
             continue
- 
-        scrip_code = str(ann.get("SCRIP_CD", "")).strip()
-        company    = (ann.get("SLONGNAME") or scrip_code).strip()
-        ann_date   = (ann.get("NEWS_DT") or ann.get("DT_TM") or "")[:10]
- 
+
+        scrip_code = ann["scrip_code"].strip()
+        company    = ann["company"].strip()
+
         mcap = get_market_cap_cr(f"{scrip_code}.BO")
         if mcap is not None and mcap < MARKET_CAP_MIN_CR:
             continue
- 
+
         results.append({
-            "date":     ann_date or str(datetime.date.today()),
+            "date":     date,
             "exchange": "BSE",
             "ticker":   scrip_code,
             "company":  company,
@@ -121,46 +124,59 @@ def process_bse(raw: list[dict]) -> list[dict]:
         })
         time.sleep(0.3)
     return results
- 
-# ─── NSE ──────────────────────────────────────────────────────────────────────
- 
-def fetch_nse() -> list[dict]:
+
+# ─── NSE CORPORATE ACTIONS ────────────────────────────────────────────────────
+
+def fetch_nse_actions() -> list[dict]:
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120",
-        "Accept":     "application/json, text/plain, */*",
+        "Accept":     "application/json",
         "Referer":    "https://www.nseindia.com/",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     try:
-        session.get("https://www.nseindia.com", headers=headers, timeout=15)
-        time.sleep(2)
-        r = session.get(
-            "https://www.nseindia.com/api/corporate-announcements?index=equities&subject=all",
-            headers=headers, timeout=20
+        session.get("https://www.nseindia.com/companies-listing/corporate-filings-actions",
+                    headers=headers, timeout=15)
+        time.sleep(3)
+
+        today   = datetime.date.today()
+        from_dt = today - datetime.timedelta(days=7)
+        url = (
+            f"https://www.nseindia.com/api/corporates-corporateActions"
+            f"?index=equities"
+            f"&from_date={from_dt.strftime('%d-%m-%Y')}"
+            f"&to_date={today.strftime('%d-%m-%Y')}"
         )
+        r = session.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         data = r.json()
-        return data if isinstance(data, list) else []
+        results = data.get("data", data) if isinstance(data, dict) else data
+        print(f"   NSE corporate actions returned: {len(results)} rows")
+        return results if isinstance(results, list) else []
     except Exception as e:
-        print(f"  ⚠️  NSE fetch error: {e}")
+        print(f"  ⚠️  NSE corporate actions error: {e}")
         return []
- 
+
 def process_nse(raw: list[dict]) -> list[dict]:
     results = []
     for ann in raw:
-        # Use desc first (actual text), fall back to subject (category label)
-        subject = (ann.get("desc") or ann.get("subject") or "").strip()
+        subject = (
+            ann.get("subject") or ann.get("desc") or
+            ann.get("purpose") or ann.get("type") or ""
+        ).strip()
+        print(f"   NSE row: {subject[:80]}")
         if not subject or not is_special_situation(subject):
             continue
- 
+
         symbol   = (ann.get("symbol") or "").strip()
-        company  = (ann.get("company") or symbol).strip()
-        ann_date = (ann.get("an_dt") or ann.get("date") or "")[:10]
- 
+        company  = (ann.get("company") or ann.get("companyName") or symbol).strip()
+        ann_date = (ann.get("exDate") or ann.get("an_dt") or ann.get("date") or "")[:10]
+
         mcap = get_market_cap_cr(f"{symbol}.NS")
         if mcap is not None and mcap < MARKET_CAP_MIN_CR:
             continue
- 
+
         results.append({
             "date":     ann_date or str(datetime.date.today()),
             "exchange": "NSE",
@@ -173,16 +189,15 @@ def process_nse(raw: list[dict]) -> list[dict]:
         })
         time.sleep(0.3)
     return results
- 
-# ─── CSV WRITE ────────────────────────────────────────────────────────────────
- 
+
+# ─── CSV ──────────────────────────────────────────────────────────────────────
+
 def ensure_csv_exists():
-    """Always create the CSV with a header if it doesn't exist yet."""
     if not os.path.isfile(CSV_FILE):
         with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(HEADER)
-        print(f"  📄 Created fresh {CSV_FILE} with header row")
- 
+        print(f"  📄 Created {CSV_FILE}")
+
 def append_to_csv(rows: list[dict]):
     with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -192,53 +207,45 @@ def append_to_csv(rows: list[dict]):
                 r["category"], r["headline"], r["mcap"], r["url"],
             ])
     print(f"  ✅ Appended {len(rows)} row(s) to {CSV_FILE}")
- 
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
- 
+
 def main():
-    today     = datetime.date.today()
-    days_back = 3 if today.weekday() == 0 else 1  # Monday = look back 3 days
- 
+    today = datetime.date.today()
+
     print(f"\n{'='*55}")
-    print(f"  SPECIAL SITUATIONS SCAN — {today}  (lookback: {days_back}d)")
+    print(f"  SPECIAL SITUATIONS SCAN — {today}")
     print(f"{'='*55}")
- 
-    # Always make sure the CSV file exists before anything else
+
     ensure_csv_exists()
- 
     all_rows = []
- 
-    print("\n📡 Fetching BSE...")
-    bse_raw  = fetch_bse(days_back=days_back)
+
+    print("\n📡 Fetching BSE XML feed...")
+    bse_raw  = fetch_bse_xml()
     print(f"   Raw announcements : {len(bse_raw)}")
     bse_hits = process_bse(bse_raw)
     print(f"   After filters     : {len(bse_hits)}")
     all_rows.extend(bse_hits)
- 
-    print("\n📡 Fetching NSE...")
-    nse_raw  = fetch_nse()
-    print(f"   Raw announcements : {len(nse_raw)}")
-    print("\n   --- NSE RAW SUBJECTS ---")
-    for ann in nse_raw[:20]:
-        subject = (ann.get("desc") or ann.get("subject") or "NO SUBJECT").strip()
-        print(f"   {subject}")
-    print("   --- END ---\n")
+
+    print("\n📡 Fetching NSE corporate actions...")
+    nse_raw  = fetch_nse_actions()
+    print(f"   Raw rows          : {len(nse_raw)}")
     nse_hits = process_nse(nse_raw)
     print(f"   After filters     : {len(nse_hits)}")
     all_rows.extend(nse_hits)
- 
+
     print(f"\n{'─'*55}")
     print(f"  TOTAL FOUND: {len(all_rows)}")
     print(f"{'─'*55}\n")
- 
+
     if all_rows:
         for r in all_rows:
             print(f"  [{r['exchange']}] {r['ticker']:12s} | {r['category']:25s} | ₹{r['mcap']} Cr")
         append_to_csv(all_rows)
     else:
         print("  ✅ No special situations today. CSV unchanged.")
- 
+
     print("\nDone.\n")
- 
+
 if __name__ == "__main__":
     main()
