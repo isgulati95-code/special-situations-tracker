@@ -215,6 +215,11 @@ def main():
     print("\n📡 Fetching NSE...")
     nse_raw  = fetch_nse()
     print(f"   Raw announcements : {len(nse_raw)}")
+    print("\n   --- NSE RAW SUBJECTS ---")
+    for ann in nse_raw[:20]:
+        subject = (ann.get("subject") or ann.get("desc") or "NO SUBJECT").strip()
+        print(f"   {subject}")
+    print("   --- END ---\n")
     nse_hits = process_nse(nse_raw)
     print(f"   After filters     : {len(nse_hits)}")
     all_rows.extend(nse_hits)
